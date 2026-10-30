@@ -3,9 +3,12 @@
 Reads the logins Claude Code (~/.claude/.credentials.json) and Codex
 (~/.codex/auth.json) already store, so there's nothing to set up.
 Drag to move, click a section for the breakdown, x to close.
+Pops up a warning when a recent chat did something IT security would worry about.
 Opening it again while it's running closes it (open/close toggle).
 """
 
+import ctypes
+import ctypes.wintypes
 import json
 import math
 import socket
@@ -17,6 +20,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import security_check
 import usage_details
 
 HOME = Path.home()
@@ -24,6 +28,7 @@ CLAUDE_CREDS = HOME / ".claude" / ".credentials.json"
 CODEX_AUTH = HOME / ".codex" / "auth.json"
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 POSITION_FILE = APP_DIR / "position.json"
+SEEN_FILE = APP_DIR / "security_seen.json"  # warnings already shown, so each pops up once
 REFRESH_MS = 2 * 60 * 1000
 TOGGLE_PORT = 47821  # a second launch tells the running widget to close
 
@@ -139,6 +144,39 @@ def draw_codex_logo(canvas, x, y, size):
 LOGOS = {"Claude": draw_claude_logo, "Codex": draw_codex_logo}
 
 
+def monitor_area(x, y):
+    """(left, top, right, bottom) of the work area of the screen containing x, y."""
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
+
+    try:
+        user32 = ctypes.windll.user32
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        handle = user32.MonitorFromPoint(ctypes.wintypes.POINT(x, y), 2)  # 2 = nearest screen
+        info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+        user32.GetMonitorInfoW(ctypes.c_void_p(handle), ctypes.byref(info))
+        r = info.rcWork
+        return r.left, r.top, r.right, r.bottom
+    except (AttributeError, OSError):
+        return 0, 0, 10000, 10000
+
+
+def place_beside(root, width, height):
+    """x, y for a panel next to the widget, kept on the widget's own screen."""
+    rx, ry, rw, rh = root.winfo_x(), root.winfo_y(), root.winfo_width(), root.winfo_height()
+    left, top, right, bottom = monitor_area(rx + rw // 2, ry + rh // 2)
+    x = rx - width - 6
+    if x < left:
+        x = rx + rw + 6
+    if x + width > right:
+        x = max(right - width, left)
+    y = min(max(ry, top), max(bottom - height, top))
+    return x, y
+
+
 def close_running_copy():
     """If the widget is already open, tell it to close and return True."""
     try:
@@ -167,9 +205,11 @@ class UsageWidget:
         self.updated = None
         self.detail = None
         self.detail_name = None
+        self.alert = None
 
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="Refresh now", command=self.refresh_now)
+        self.menu.add_command(label="Security check (7 days)", command=self.security_week)
         self.menu.add_separator()
         self.menu.add_command(label="Close", command=self.close)
 
@@ -219,6 +259,8 @@ class UsageWidget:
         self.root.geometry(f"+{x}+{y}")
         if self.detail:
             self.position_detail()
+        if self.alert:
+            self.position_alert()
 
     def release(self, event):
         moved = abs(event.x_root - self.press_at[0]) + abs(event.y_root - self.press_at[1])
@@ -250,12 +292,84 @@ class UsageWidget:
                 results[name] = fetch()
             except Exception as exc:  # show the problem in the widget instead of crashing
                 results[name] = str(exc)[:60]
-        self.root.after(0, self.show, results)
+        try:
+            findings = security_check.recent(1)
+        except Exception:
+            findings = []
+        self.root.after(0, self.show, results, findings)
 
-    def show(self, results):
+    def show(self, results, findings):
         self.results = results
         self.updated = datetime.now()
         self.draw()
+        try:
+            seen = set(json.loads(SEEN_FILE.read_text()))
+        except (OSError, ValueError):
+            seen = set()
+        new = [f for f in findings if f["key"] not in seen]
+        if new:
+            self.show_alert(new, "New security warning")
+            try:
+                SEEN_FILE.write_text(json.dumps(sorted(seen | {f["key"] for f in findings})))
+            except OSError:
+                pass
+
+    # --- security warnings ----------------------------------------------------
+    def security_week(self):
+        def work():
+            try:
+                findings = security_check.recent(7)
+            except Exception as exc:
+                findings = str(exc)
+            self.root.after(0, self.show_alert, findings, "Security check - last 7 days")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_alert(self, findings, heading):
+        if self.alert:
+            self.alert.destroy()
+        self.alert = tk.Toplevel(self.root)
+        self.alert.overrideredirect(True)
+        self.alert.attributes("-topmost", True)
+        self.alert.attributes("-alpha", 0.97)
+        frame = tk.Frame(self.alert, bg=BG, highlightthickness=2, highlightbackground=RED_BAR)
+        frame.pack(fill="both", expand=True)
+        widgets = [frame]
+
+        def label(text, colour=TEXT, size=8, bold=False, pady=(0, 0)):
+            w = tk.Label(frame, text=text, fg=colour, bg=BG, font=("Segoe UI Semibold" if bold else "Segoe UI", size),
+                         anchor="w", justify="left", wraplength=DETAIL_WIDTH - 28)
+            w.pack(fill="x", padx=12, pady=pady)
+            widgets.append(w)
+
+        label("⚠ " + heading, RED_BAR, 10, bold=True, pady=(10, 6))
+        if isinstance(findings, str):
+            label(findings, RED_BAR)
+        elif not findings:
+            label("Nothing risky found.", GREEN)
+        else:
+            for f in findings[:6]:
+                label(f["risk"], TEXT, 9, bold=True)
+                label(f"{f['chat']} - {f['when'].astimezone():%a %H:%M}", SUBTLE)
+                label(f["detail"], "#6a6a6a", 7, pady=(0, 6))
+            if len(findings) > 6:
+                label(f"...and {len(findings) - 6} more. Right-click > Security check to see the week.", SUBTLE)
+        label("Click to dismiss", "#5a5a5a", 7, pady=(2, 8))
+        for w in widgets:
+            w.bind("<Button-1>", lambda e: self.close_alert())
+
+        self.position_alert()
+
+    def position_alert(self):
+        self.alert.update_idletasks()
+        height = self.alert.winfo_reqheight()
+        x, y = place_beside(self.root, DETAIL_WIDTH, height)
+        self.alert.geometry(f"{DETAIL_WIDTH}x{height}+{x}+{y}")
+
+    def close_alert(self):
+        if self.alert:
+            self.alert.destroy()
+            self.alert = None
 
     # --- drawing ----------------------------------------------------------
     def draw(self):
@@ -338,10 +452,9 @@ class UsageWidget:
 
     def position_detail(self):
         self.detail.update_idletasks()
-        x = self.root.winfo_x() - DETAIL_WIDTH - 6
-        if x < 0:
-            x = self.root.winfo_x() + self.root.winfo_width() + 6
-        self.detail.geometry(f"{DETAIL_WIDTH}x{self.detail.winfo_reqheight()}+{x}+{self.root.winfo_y()}")
+        height = self.detail.winfo_reqheight()
+        x, y = place_beside(self.root, DETAIL_WIDTH, height)
+        self.detail.geometry(f"{DETAIL_WIDTH}x{height}+{x}+{y}")
 
     def add_label(self, text, colour=TEXT, size=8, bold=False, right=None, pady=(0, 0)):
         row = tk.Frame(self.body, bg=BG)
