@@ -197,7 +197,7 @@ def pace(pct, resets, window, now):
     if resets is None:
         return "", False
     if pct >= 100:
-        return f"Limit reached - back {fmt_when(resets, now)}", True
+        return f"Limit reached – back {fmt_when(resets, now)}", True
     elapsed = (now - (resets - window)).total_seconds()
     if pct <= 0 or elapsed <= 0:
         return "Plenty left", False
@@ -231,12 +231,12 @@ def recommendations(name, rows, detail, other_rows, now):
             tips.append(f"Weekly is ahead of pace. Keep to about {per_day:.0f}% a day until it resets "
                         f"{fmt_when(resets, now)}.")
     if session and session[1] >= 80 and session[2]:
-        tips.append(f"Session nearly full - pause big jobs until it resets {fmt_when(session[2], now)}.")
+        tips.append(f"Session nearly full – pause big jobs until it resets {fmt_when(session[2], now)}.")
 
     other_week = next((r for r in other_rows or [] if "Weekly" in r[0]), None)
     other = "Codex" if name == "Claude" else "Claude"
     if week and other_week and week[1] >= 70 and other_week[1] <= 60:
-        tips.append(f"{other} has {100 - other_week[1]:.0f}% of its week left - move routine jobs "
+        tips.append(f"{other} has {100 - other_week[1]:.0f}% of its week left – move routine jobs "
                     f"(emails, comments, checklists) there.")
 
     if detail:
@@ -247,7 +247,7 @@ def recommendations(name, rows, detail, other_rows, now):
         big = [c for c in chats[:5] if c["avg_context"] > 120_000]
         if big:
             tips.append(f"\"{big[0]['title']}\" averaged {big[0]['avg_context'] / 1000:.0f}k tokens per message. "
-                        f"Long chats re-send everything each time - start a new chat (or /clear) between tasks.")
+                        f"Long chats re-send everything each time – start a new chat (or /clear) between tasks.")
         if name == "Claude":
             opus = detail["models"].get("Opus", 0) + detail["models"].get("Fable", 0)
             if opus >= 60:
@@ -266,7 +266,7 @@ def recommendations(name, rows, detail, other_rows, now):
                 tips.append(f"About {week[1] - detail['logged_total']:.0f}% was used outside this PC "
                             f"(ChatGPT app / cloud tasks).")
     if not tips:
-        tips.append("Nothing to change - you're on track.")
+        tips.append("Nothing to change – you're on track.")
     return tips
 
 

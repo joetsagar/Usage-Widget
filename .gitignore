@@ -2,3 +2,7 @@ __pycache__/
 position.json
 
 security_seen.json
+
+build/
+dist/
+*.spec

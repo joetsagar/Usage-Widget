@@ -17,9 +17,11 @@ import sys
 import threading
 import tkinter as tk
 import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import kilo_usage
 import security_check
 import usage_details
 
@@ -38,10 +40,12 @@ SUBTLE = "#8a8a8a"
 TRACK = "#3a3a3a"
 GREY_BAR = "#9a9a9a"
 ORANGE_BAR = "#d97757"
-RED_BAR = "#e5534b"
+RED_BAR = "#f07068"
+WARNING = "#e2b340"
+BORDER = "#454545"
 GREEN = "#7cc28a"
 
-WIDTH = 240
+WIDTH = 280
 DETAIL_WIDTH = 320
 BAR_HEIGHT = 6
 
@@ -50,7 +54,59 @@ BAR_HEIGHT = 6
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.verify_flags &= ~ssl.VERIFY_X509_STRICT
 
-WINDOWS = {"Session (5hr)": timedelta(hours=5), "Weekly (7 day)": timedelta(days=7)}
+WINDOWS = {"Session (5 hours)": timedelta(hours=5), "Weekly (7 days)": timedelta(days=7)}
+
+
+def enable_dpi_awareness():
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()
+
+
+def system_alpha(value):
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            return value if winreg.QueryValueEx(key, "EnableTransparency")[0] else 1.0
+    except (ImportError, OSError):
+        return 1.0
+
+
+def round_corners(window):
+    if sys.platform == "win32":
+        try:
+            window.update_idletasks()
+            user32 = ctypes.windll.user32
+            user32.GetParent.restype = ctypes.wintypes.HWND
+            hwnd = user32.GetParent(ctypes.wintypes.HWND(window.winfo_id()))
+            preference = ctypes.c_int(2)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                ctypes.wintypes.HWND(hwnd), 33, ctypes.byref(preference), ctypes.sizeof(preference))
+        except (AttributeError, OSError):
+            pass
+
+
+def elapsed_fraction(resets, window, now=None):
+    if resets is None or window.total_seconds() <= 0:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return max(0.0, min(1.0, (now - (resets - window)).total_seconds() / window.total_seconds()))
+
+
+def friendly_error(name, exc):
+    login = "open Claude Code" if name == "Claude" else "run codex login"
+    if name == "Kilo Code":
+        return "Can't read Kilo usage – retrying in 2 min"
+    if isinstance(exc, FileNotFoundError):
+        return f"{name} login missing – {login}"
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in (401, 403):
+        return f"{name} login needs attention – {login}"
+    if isinstance(exc, RuntimeError) and "expired" in str(exc).lower():
+        return f"{name} login expired – {login}"
+    return f"Can't reach {name} – retrying in 2 min"
 
 
 def get_json(url, headers):
@@ -72,7 +128,7 @@ def fetch_claude():
         },
     )
     rows = []
-    for key, label in (("five_hour", "Session (5hr)"), ("seven_day", "Weekly (7 day)")):
+    for key, label in (("five_hour", "Session (5 hours)"), ("seven_day", "Weekly (7 days)")):
         window = data.get(key)
         if window:
             resets = datetime.fromisoformat(window["resets_at"]) if window.get("resets_at") else None
@@ -92,7 +148,7 @@ def fetch_codex():
     )
     limits = data.get("rate_limit") or {}
     rows = []
-    for key, label in (("primary_window", "Session (5hr)"), ("secondary_window", "Weekly (7 day)")):
+    for key, label in (("primary_window", "Session (5 hours)"), ("secondary_window", "Weekly (7 days)")):
         window = limits.get(key)
         if window:
             resets = datetime.fromtimestamp(window["reset_at"], timezone.utc) if window.get("reset_at") else None
@@ -114,7 +170,7 @@ def bar_colour(pct):
     if pct >= 90:
         return RED_BAR
     if pct >= 75:
-        return ORANGE_BAR
+        return WARNING
     return GREY_BAR
 
 
@@ -189,18 +245,33 @@ def close_running_copy():
 
 class UsageWidget:
     def __init__(self):
+        if sys.platform == "win32":
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("UsageWidget.AIUsage")
+        enable_dpi_awareness()
         self.root = tk.Tk()
+        self.scale = self.root.winfo_fpixels("1i") / 96
+        global WIDTH, DETAIL_WIDTH, BAR_HEIGHT
+        WIDTH = round(280 * self.scale)
+        DETAIL_WIDTH = round(360 * self.scale)
+        BAR_HEIGHT = round(6 * self.scale)
+        icon_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+        self.root.iconbitmap(str(icon_dir / "usage_widget.ico"))
         self.root.title("AI Usage")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.95)
+        self.root.attributes("-alpha", system_alpha(0.95))
         self.root.configure(bg=BG)
 
         self.canvas = tk.Canvas(self.root, width=WIDTH, height=60, bg=BG, highlightthickness=1,
-                                highlightbackground="#ffffff", highlightcolor="#ffffff", bd=0)
+                                highlightbackground=BORDER, highlightcolor=BORDER, takefocus=True, bd=0)
         self.canvas.pack()
 
-        self.results = {"Claude": None, "Codex": None}
+        self.results = {"Claude": None, "Codex": None, "Kilo Code": None}
+        self.errors = {}
+        self.last_good = {}
+        self.fetching = False
+        self.tooltip = None
+        self.selected = "Claude"
         self.sections = {}  # name -> (top y, bottom y), for click hit-testing
         self.updated = None
         self.detail = None
@@ -218,10 +289,57 @@ class UsageWidget:
         self.canvas.bind("<ButtonRelease-1>", self.release)
         self.canvas.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
 
+        self.root.bind("<Escape>", self.escape)
+        self.root.bind("<F5>", lambda e: self.refresh_now())
+        self.root.bind("<Return>", lambda e: self.toggle_detail(self.selected))
+        self.root.bind("1", lambda e: self.toggle_detail("Claude"))
+        self.root.bind("2", lambda e: self.toggle_detail("Codex"))
+        self.root.bind("<Tab>", self.select_next)
+        self.root.bind("<Shift-F10>", self.keyboard_menu)
+        self.canvas.bind("<Motion>", self.hover)
+        self.canvas.bind("<Leave>", lambda e: self.hide_tooltip())
+        self.canvas.bind("<FocusIn>", lambda e: self.draw())
+        self.canvas.bind("<FocusOut>", lambda e: self.draw())
+        self.root.after_idle(lambda: round_corners(self.root))
         self.listen_for_toggle()
         self.place_window()
         self.draw()
         self.refresh()
+
+    def escape(self, event=None):
+        if self.alert:
+            self.close_alert()
+        elif self.detail:
+            self.toggle_detail(self.detail_name)
+        else:
+            self.close()
+        return "break"
+
+    def select_next(self, event=None):
+        self.selected = "Codex" if self.selected == "Claude" else "Claude"
+        self.draw()
+        return "break"
+
+    def keyboard_menu(self, event=None):
+        self.menu.tk_popup(self.root.winfo_rootx() + 12, self.root.winfo_rooty() + 12)
+        return "break"
+
+    def hide_tooltip(self):
+        if self.tooltip:
+            self.tooltip.destroy()
+            self.tooltip = None
+
+    def hover(self, event):
+        clickable = any(top <= event.y < bottom for top, bottom in self.sections.values())
+        self.canvas.configure(cursor="hand2" if clickable else "")
+        if not self.tooltip:
+            self.tooltip = tk.Toplevel(self.root)
+            self.tooltip.overrideredirect(True)
+            self.tooltip.attributes("-topmost", True)
+            tk.Label(self.tooltip, text="Click Claude/Codex for pace and tips. Right-click for menu.\n"
+                     "F5: refresh · 1/2: details · Tab/Enter: select/open · Esc: close",
+                     bg=BG, fg=TEXT, font=("Segoe UI", 8), padx=8, pady=6).pack()
+            self.tooltip.geometry(f"+{self.root.winfo_x()}+{self.root.winfo_y() + self.root.winfo_height() + 6}")
 
     # --- open/close toggle ------------------------------------------------
     def listen_for_toggle(self):
@@ -238,6 +356,7 @@ class UsageWidget:
         threading.Thread(target=wait, daemon=True).start()
 
     def close(self):
+        self.hide_tooltip()
         self.root.destroy()
 
     # --- window position and clicks ----------------------------------------
@@ -250,12 +369,15 @@ class UsageWidget:
         self.root.geometry(f"+{x}+{y}")
 
     def press(self, event):
+        self.canvas.focus_set()
+        self.hide_tooltip()
         self.drag_offset = (event.x, event.y)
         self.press_at = (event.x_root, event.y_root)
 
     def drag(self, event):
         x = self.root.winfo_pointerx() - self.drag_offset[0]
         y = self.root.winfo_pointery() - self.drag_offset[1]
+        self.hide_tooltip()
         self.root.geometry(f"+{x}+{y}")
         if self.detail:
             self.position_detail()
@@ -279,19 +401,22 @@ class UsageWidget:
 
     # --- data -------------------------------------------------------------
     def refresh(self):
-        threading.Thread(target=self.fetch_all, daemon=True).start()
+        self.refresh_now()
         self.root.after(REFRESH_MS, self.refresh)
 
     def refresh_now(self):
+        if self.fetching:
+            return
+        self.fetching = True
         threading.Thread(target=self.fetch_all, daemon=True).start()
 
     def fetch_all(self):
         results = {}
-        for name, fetch in (("Claude", fetch_claude), ("Codex", fetch_codex)):
+        for name, fetch in (("Claude", fetch_claude), ("Codex", fetch_codex), ("Kilo Code", lambda: kilo_usage.fetch(get_json))):
             try:
                 results[name] = fetch()
             except Exception as exc:  # show the problem in the widget instead of crashing
-                results[name] = str(exc)[:60]
+                results[name] = friendly_error(name, exc)
         try:
             findings = security_check.recent(1)
         except Exception:
@@ -299,8 +424,14 @@ class UsageWidget:
         self.root.after(0, self.show, results, findings)
 
     def show(self, results, findings):
-        self.results = results
-        self.updated = datetime.now()
+        self.fetching = False
+        self.errors = {name: data for name, data in results.items() if isinstance(data, str)}
+        for name, data in results.items():
+            if not isinstance(data, str):
+                self.last_good[name] = data
+            self.results[name] = self.last_good.get(name, data)
+        if len(self.errors) < len(results):
+            self.updated = datetime.now()
         self.draw()
         try:
             seen = set(json.loads(SEEN_FILE.read_text()))
@@ -321,7 +452,7 @@ class UsageWidget:
                 findings = security_check.recent(7)
             except Exception as exc:
                 findings = str(exc)
-            self.root.after(0, self.show_alert, findings, "Security check - last 7 days")
+            self.root.after(0, self.show_alert, findings, "Security check · last 7 days")
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -331,18 +462,18 @@ class UsageWidget:
         self.alert = tk.Toplevel(self.root)
         self.alert.overrideredirect(True)
         self.alert.attributes("-topmost", True)
-        self.alert.attributes("-alpha", 0.97)
+        self.alert.attributes("-alpha", system_alpha(0.97))
         frame = tk.Frame(self.alert, bg=BG, highlightthickness=2, highlightbackground=RED_BAR)
         frame.pack(fill="both", expand=True)
         widgets = [frame]
 
-        def label(text, colour=TEXT, size=8, bold=False, pady=(0, 0)):
+        def label(text, colour=TEXT, size=10, bold=False, pady=(0, 0)):
             w = tk.Label(frame, text=text, fg=colour, bg=BG, font=("Segoe UI Semibold" if bold else "Segoe UI", size),
                          anchor="w", justify="left", wraplength=DETAIL_WIDTH - 28)
             w.pack(fill="x", padx=12, pady=pady)
             widgets.append(w)
 
-        label("⚠ " + heading, RED_BAR, 10, bold=True, pady=(10, 6))
+        label("⚠ " + heading, RED_BAR, 11, bold=True, pady=(10, 6))
         if isinstance(findings, str):
             label(findings, RED_BAR)
         elif not findings:
@@ -351,19 +482,39 @@ class UsageWidget:
             for f in findings[:6]:
                 label(f["risk"], TEXT, 9, bold=True)
                 label(f"{f['chat']} - {f['when'].astimezone():%a %H:%M}", SUBTLE)
-                label(f["detail"], "#6a6a6a", 7, pady=(0, 6))
+                label(f["detail"], SUBTLE, 8, pady=(0, 6))
             if len(findings) > 6:
                 label(f"...and {len(findings) - 6} more. Right-click > Security check to see the week.", SUBTLE)
-        label("Click to dismiss", "#5a5a5a", 7, pady=(2, 8))
+        label("Click or press Esc to dismiss", SUBTLE, 8, pady=(2, 8))
         for w in widgets:
             w.bind("<Button-1>", lambda e: self.close_alert())
 
+        round_corners(self.alert)
         self.position_alert()
 
     def position_alert(self):
         self.alert.update_idletasks()
         height = self.alert.winfo_reqheight()
         x, y = place_beside(self.root, DETAIL_WIDTH, height)
+        if self.detail:
+            dx, dy = self.detail.winfo_x(), self.detail.winfo_y()
+            dw, dh = self.detail.winfo_width(), self.detail.winfo_height()
+            left, top, right, bottom = monitor_area(self.root.winfo_x(), self.root.winfo_y())
+            if x < dx + dw and x + DETAIL_WIDTH > dx and y < dy + dh and y + height > dy:
+                candidates = [(dx, dy + dh + 6), (dx, dy - height - 6),
+                              (self.root.winfo_x() + self.root.winfo_width() + 6, y),
+                              (self.root.winfo_x() - DETAIL_WIDTH - 6, y)]
+                for ax, ay in candidates:
+                    if (left <= ax and ax + DETAIL_WIDTH <= right and top <= ay and ay + height <= bottom
+                            and not (ax < dx + dw and ax + DETAIL_WIDTH > dx and ay < dy + dh and ay + height > dy)):
+                        x, y = ax, ay
+                        break
+                else:
+                    # On small screens show one panel at a time instead of hiding content.
+                    self.detail.destroy()
+                    self.detail = None
+                    self.detail_name = None
+                    self.draw()
         self.alert.geometry(f"{DETAIL_WIDTH}x{height}+{x}+{y}")
 
     def close_alert(self):
@@ -375,46 +526,81 @@ class UsageWidget:
     def draw(self):
         c = self.canvas
         c.delete("all")
+        self.sections.clear()
+        scale = self.scale
+        # Canvas coordinates use logical pixels; fonts already scale through Tk.
+        width = WIDTH / scale
+        bar_height = BAR_HEIGHT / scale
         pad = 12
-        y = 10
-        c.create_text(WIDTH - 11, 9, text="✕", anchor="ne", fill=SUBTLE, font=("Segoe UI", 9))
-        for name in ("Claude", "Codex"):
+        y = 12
+        c.create_text(width - 11, 9, text="✕", anchor="ne", fill=SUBTLE, font=("Segoe UI", 10))
+        for name in ("Claude", "Codex", "Kilo Code"):
             top = y - 6
-            LOGOS[name](c, pad, y, 18)
-            c.create_text(pad + 26, y + 9, text=name, anchor="w", fill=TEXT, font=("Segoe UI Semibold", 10))
+            stale = name in self.errors
+            row_colour = SUBTLE if stale else TEXT
+            if name == "Kilo Code":
+                c.create_rectangle(pad, y, pad + 18, y + 18, fill="#f8e45c", outline="")
+                c.create_text(pad + 9, y + 9, text="K", fill=BG, font=("Segoe UI", 10, "bold"))
+            else:
+                LOGOS[name](c, pad, y, 18)
+            c.create_text(pad + 26, y + 9, text=name, anchor="w", fill=row_colour, font=("Segoe UI Semibold", 11))
             arrow = "▾" if self.detail_name == name else "›"
-            c.create_text(pad + 26 + 52, y + 9, text=arrow, anchor="w", fill=SUBTLE, font=("Segoe UI", 10))
+            if name != "Kilo Code":
+                c.create_text(pad + 26 + 62, y + 9, text=arrow, anchor="w", fill=SUBTLE, font=("Segoe UI", 10))
             y += 26
             rows = self.results.get(name)
             if rows is None:
-                c.create_text(pad, y, text="Loading...", anchor="nw", fill=SUBTLE, font=("Segoe UI", 8))
+                c.create_text(pad, y, text=f"Checking {name}…", anchor="nw", fill=SUBTLE, font=("Segoe UI", 8))
                 y += 20
             elif isinstance(rows, str):
                 c.create_text(pad, y, text=rows, anchor="nw", fill=RED_BAR, font=("Segoe UI", 8),
-                              width=WIDTH - 2 * pad)
-                y += 30
+                              width=width - 2 * pad)
+                y = c.bbox(c.find_all()[-1])[3] + 8
+            elif isinstance(rows, dict):
+                for label, value in kilo_usage.summary(rows):
+                    c.create_text(pad, y, text=label, anchor="nw", fill=row_colour, font=("Segoe UI", 10))
+                    c.create_text(width - pad, y, text=value, anchor="ne", fill=row_colour, font=("Segoe UI", 10))
+                    y += 21
             else:
-                for label, pct, resets, _ in rows:
-                    c.create_text(pad, y, text=label, anchor="nw", fill=TEXT, font=("Segoe UI", 9))
-                    c.create_text(WIDTH - pad, y, text=f"{pct:.0f}%", anchor="ne", fill=TEXT, font=("Segoe UI", 9))
-                    y += 19
-                    c.create_rectangle(pad, y, WIDTH - pad, y + BAR_HEIGHT, fill=TRACK, outline="")
-                    fill_to = pad + (WIDTH - 2 * pad) * min(pct, 100) / 100
+                for label, pct, resets, window in rows:
+                    c.create_text(pad, y, text=label, anchor="nw", fill=row_colour, font=("Segoe UI", 10))
+                    c.create_text(width - pad, y, text=f"{pct:.0f}%", anchor="ne", fill=row_colour, font=("Segoe UI Semibold", 11))
+                    y += 23
+                    c.create_rectangle(pad, y, width - pad, y + bar_height, fill=TRACK, outline="")
+                    fill_to = pad + (width - 2 * pad) * min(pct, 100) / 100
                     if pct > 0:
-                        c.create_rectangle(pad, y, fill_to, y + BAR_HEIGHT, fill=bar_colour(pct), outline="")
-                    y += BAR_HEIGHT + 4
+                        c.create_rectangle(pad, y, fill_to, y + bar_height, fill=SUBTLE if stale else bar_colour(pct), outline="")
+                    fraction = elapsed_fraction(resets, window)
+                    if fraction is not None:
+                        tick = pad + (width - 2 * pad) * fraction
+                        c.create_line(tick, y - 2, tick, y + bar_height + 2, fill=TEXT, width=2)
+                    y += bar_height + 4
                     c.create_text(pad, y, text=reset_text(resets), anchor="nw", fill=SUBTLE, font=("Segoe UI", 8))
                     y += 20
             y += 6
-            self.sections[name] = (top, y - 2)
+            if stale and not isinstance(rows, str):
+                item = c.create_text(pad, y, text="Stale · " + self.errors[name], anchor="nw",
+                                    fill=WARNING, font=("Segoe UI", 8), width=width - 2 * pad)
+                y = c.bbox(item)[3] + 8
+            if name != "Kilo Code":
+                self.sections[name] = (top * scale, (y - 2) * scale)
         if self.updated:
-            c.create_text(WIDTH - pad, y, text=f"Updated {self.updated:%H:%M}", anchor="ne", fill="#5a5a5a",
-                          font=("Segoe UI", 7))
+            c.create_text(width - pad, y, text=f"Updated {self.updated:%H:%M}", anchor="ne", fill=SUBTLE,
+                          font=("Segoe UI", 8))
             y += 12
-        c.configure(height=y + 4)
+        c.create_text(pad, y, text="| time elapsed · click a provider for tips", anchor="nw",
+                      fill=SUBTLE, font=("Segoe UI", 8))
+        y += 20
+        if c.focus_get() == c:
+            top, bottom = self.sections.get(self.selected, (0, 0))
+            c.create_rectangle(4, top / scale, width - 4, bottom / scale, outline=SUBTLE, dash=(2, 2))
+        c.scale("all", 0, 0, scale, scale)
+        c.configure(height=round((y + 4) * scale))
 
     # --- detail panel -------------------------------------------------------
     def toggle_detail(self, name):
+        if name == "Kilo Code":
+            return
         if self.detail:
             self.detail.destroy()
             self.detail = None
@@ -423,7 +609,7 @@ class UsageWidget:
                 self.draw()
                 return
         rows = self.results.get(name)
-        if not isinstance(rows, list):
+        if not isinstance(rows, (list, dict)):
             return
         self.detail_name = name
         self.draw()
@@ -431,11 +617,11 @@ class UsageWidget:
         self.detail = tk.Toplevel(self.root)
         self.detail.overrideredirect(True)
         self.detail.attributes("-topmost", True)
-        self.detail.attributes("-alpha", 0.97)
-        self.body = tk.Frame(self.detail, bg=BG, highlightthickness=1, highlightbackground="#ffffff")
+        self.detail.attributes("-alpha", system_alpha(0.97))
+        self.body = tk.Frame(self.detail, bg=BG, highlightthickness=1, highlightbackground=BORDER)
         self.body.pack(fill="both", expand=True)
         self.body.bind("<Button-1>", lambda e: self.toggle_detail(name))
-        self.add_label(f"{name} - working it out...", SUBTLE, 9)
+        self.add_label(f"{name} · checking usage…", SUBTLE, 9)
         self.position_detail()
 
         other = self.results.get("Codex" if name == "Claude" else "Claude")
@@ -443,7 +629,7 @@ class UsageWidget:
 
         def work():
             try:
-                info = usage_details.build(name, rows, other)
+                info = rows if name == "Kilo Code" else usage_details.build(name, rows, other)
             except Exception as exc:
                 info = {"error": str(exc)}
             self.root.after(0, self.fill_detail, name, info)
@@ -455,8 +641,11 @@ class UsageWidget:
         height = self.detail.winfo_reqheight()
         x, y = place_beside(self.root, DETAIL_WIDTH, height)
         self.detail.geometry(f"{DETAIL_WIDTH}x{height}+{x}+{y}")
+        round_corners(self.detail)
+        if self.alert:
+            self.position_alert()
 
-    def add_label(self, text, colour=TEXT, size=8, bold=False, right=None, pady=(0, 0)):
+    def add_label(self, text, colour=TEXT, size=10, bold=False, right=None, pady=(0, 0)):
         row = tk.Frame(self.body, bg=BG)
         row.pack(fill="x", padx=12, pady=pady)
         font = ("Segoe UI Semibold" if bold else "Segoe UI", size)
@@ -476,12 +665,12 @@ class UsageWidget:
             return
         for child in self.body.winfo_children():
             child.destroy()
-        self.add_label(f"{name} - this week", TEXT, 10, bold=True, pady=(10, 4))
+        self.add_label(f"{name} · this week", TEXT, 11, bold=True, pady=(10, 4))
         if "error" in info:
             self.add_label(info["error"], RED_BAR)
         else:
             for label, text in info["pace"]:
-                colour = ORANGE_BAR if "run out" in text or "reached" in text else GREEN
+                colour = WARNING if "run out" in text or "reached" in text else GREEN
                 self.add_label(f"{label}: {text}", colour)
 
             detail = info["detail"]
@@ -500,7 +689,7 @@ class UsageWidget:
                         self.add_label(model, TEXT, right=f"{pct:.0f}%")
                 if name == "Claude":
                     self.add_label("Estimated from Claude Code logs on this PC. claude.ai chats count "
-                                   "towards the limit too but aren't shown.", "#6a6a6a", 7, pady=(4, 0))
+                                   "towards the limit too but aren't shown.", SUBTLE, 8, pady=(4, 0))
             else:
                 self.add_label("No local usage logged this week.", SUBTLE, pady=(8, 0))
 
